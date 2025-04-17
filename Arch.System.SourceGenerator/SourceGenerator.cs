@@ -1,10 +1,9 @@
-﻿using System.Collections.Immutable;
-using System.Diagnostics;
-using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Text;
+using System.Collections.Immutable;
+using System.Text;
 
 namespace Arch.System.SourceGenerator;
 
@@ -18,7 +17,7 @@ public class QueryGenerator : IIncrementalGenerator
         //if (!Debugger.IsAttached) Debugger.Launch();
 
         // Register the generic attributes 
-        var attributes = $$"""
+        string attributes = $$"""
             namespace Arch.System.SourceGenerator
             {
             #if NET7_0_OR_GREATER
@@ -30,7 +29,7 @@ public class QueryGenerator : IIncrementalGenerator
             }
         """;
         context.RegisterPostInitializationOutput(ctx => ctx.AddSource("Attributes.g.cs", SourceText.From(attributes, Encoding.UTF8)));
-        
+
         // Do a simple filter for methods marked with update
         IncrementalValuesProvider<MethodDeclarationSyntax> methodDeclarations = context.SyntaxProvider.CreateSyntaxProvider(
                  static (s, _) => s is MethodDeclarationSyntax { AttributeLists.Count: > 0 },
@@ -39,7 +38,10 @@ public class QueryGenerator : IIncrementalGenerator
 
         // Combine the selected enums with the `Compilation`
         IncrementalValueProvider<(Compilation, ImmutableArray<MethodDeclarationSyntax>)> compilationAndMethods = context.CompilationProvider.Combine(methodDeclarations.WithComparer(Comparer.Instance).Collect());
-        context.RegisterSourceOutput(compilationAndMethods, static (spc, source) => Generate(source.Item1, source.Item2, spc));
+        context.RegisterSourceOutput(compilationAndMethods, static (spc, source) =>
+        {
+            Generate(source.Item1, source.Item2, spc);
+        });
     }
 
     /// <summary>
@@ -49,14 +51,14 @@ public class QueryGenerator : IIncrementalGenerator
     /// <param name="methodSymbol">The <see cref="IMethodSymbol"/> which will be added/mapped to its class.</param>
     private static void AddMethodToClass(IMethodSymbol methodSymbol)
     {
-        if (!_classToMethods.TryGetValue(methodSymbol.ContainingSymbol, out var list))
+        if (!_classToMethods.TryGetValue(methodSymbol.ContainingSymbol, out List<IMethodSymbol>? list))
         {
             list = new List<IMethodSymbol>();
             _classToMethods[methodSymbol.ContainingSymbol] = list;
         }
         list.Add(methodSymbol);
     }
-    
+
     /// <summary>
     ///     Returns a <see cref="MethodDeclarationSyntax"/> if its annocated with a attribute of <see cref="name"/>.
     /// </summary>
@@ -66,17 +68,17 @@ public class QueryGenerator : IIncrementalGenerator
     private static MethodDeclarationSyntax? GetMethodSymbolIfAttributeof(GeneratorSyntaxContext context, string name)
     {
         // we know the node is a EnumDeclarationSyntax thanks to IsSyntaxTargetForGeneration
-        var enumDeclarationSyntax = (MethodDeclarationSyntax)context.Node;
+        MethodDeclarationSyntax enumDeclarationSyntax = (MethodDeclarationSyntax)context.Node;
 
         // loop through all the attributes on the method
-        foreach (var attributeListSyntax in enumDeclarationSyntax.AttributeLists)
+        foreach (AttributeListSyntax attributeListSyntax in enumDeclarationSyntax.AttributeLists)
         {
-            foreach (var attributeSyntax in attributeListSyntax.Attributes)
+            foreach (AttributeSyntax attributeSyntax in attributeListSyntax.Attributes)
             {
                 if (ModelExtensions.GetSymbolInfo(context.SemanticModel, attributeSyntax).Symbol is not IMethodSymbol attributeSymbol) continue;
-                
-                var attributeContainingTypeSymbol = attributeSymbol.ContainingType;
-                var fullName = attributeContainingTypeSymbol.ToDisplayString();
+
+                INamedTypeSymbol attributeContainingTypeSymbol = attributeSymbol.ContainingType;
+                string fullName = attributeContainingTypeSymbol.ToDisplayString();
 
                 // Is the attribute the [EnumExtensions] attribute?
                 if (fullName != name) continue;
@@ -97,16 +99,17 @@ public class QueryGenerator : IIncrementalGenerator
     private static void Generate(Compilation compilation, ImmutableArray<MethodDeclarationSyntax> methods, SourceProductionContext context)
     {
         if (methods.IsDefaultOrEmpty) return;
-        
+
         // Generate Query methods and map them to their classes
         _classToMethods = new(512);
-        foreach (var methodSyntax in methods)
+        foreach (MethodDeclarationSyntax methodSyntax in methods)
         {
             IMethodSymbol? methodSymbol = null;
             try
             {
-                var semanticModel = compilation.GetSemanticModel(methodSyntax.SyntaxTree);
+                SemanticModel semanticModel = compilation.GetSemanticModel(methodSyntax.SyntaxTree);
                 methodSymbol = ModelExtensions.GetDeclaredSymbol(semanticModel, methodSyntax) as IMethodSymbol;
+                //context.AddSource(methodSymbol.ToString(), "lol");
             }
             catch
             {
@@ -114,23 +117,45 @@ public class QueryGenerator : IIncrementalGenerator
                 continue;
             }
 
-            AddMethodToClass(methodSymbol);
-            
-            var sb = new StringBuilder();
-            var method = sb.AppendQueryMethod(methodSymbol);
-            var fileName = methodSymbol.ToDisplayString(SymbolDisplayFormat.CSharpShortErrorMessageFormat).Replace('<', '{').Replace('>', '}');
-            context.AddSource($"{fileName}.g.cs",CSharpSyntaxTree.ParseText(method.ToString()).GetRoot().NormalizeWhitespace().ToFullString());
+            try
+            {
+                AddMethodToClass(methodSymbol);
+            }
+            catch (Exception e)
+            {
+                throw new Exception(methodSymbol?.ToString());
+            }
+
+            StringBuilder sb = new();
+            StringBuilder method = sb.AppendQueryMethod(methodSymbol);
+            string fileName = methodSymbol.ToDisplayString(SymbolDisplayFormat.CSharpShortErrorMessageFormat).Replace('<', '{').Replace('>', '}');
+            try
+            {
+                //throw new Exception(method.ToString());
+                context.AddSource($"{fileName}.g.cs", CSharpSyntaxTree.ParseText(method.ToString()).GetRoot().NormalizeWhitespace().ToFullString());
+            }
+            catch
+            {
+                throw new Exception(method.ToString());
+            }
         }
 
         // Creating class that calls the created methods after another.
-        foreach (var classToMethod in _classToMethods)
+        foreach (KeyValuePair<ISymbol, List<IMethodSymbol>> classToMethod in _classToMethods)
         {
-            var template = new StringBuilder().AppendBaseSystem(classToMethod).ToString();
+            string template = new StringBuilder().AppendBaseSystem(classToMethod).ToString();
             if (string.IsNullOrEmpty(template)) continue;
-            
-            var fileName = (classToMethod.Key as INamedTypeSymbol).ToDisplayString(SymbolDisplayFormat.CSharpShortErrorMessageFormat).Replace('<', '{').Replace('>', '}');
-            context.AddSource($"{fileName}.g.cs",
-                CSharpSyntaxTree.ParseText(template).GetRoot().NormalizeWhitespace().ToFullString());
+
+            try
+            {
+                string fileName = (classToMethod.Key as INamedTypeSymbol).ToDisplayString(SymbolDisplayFormat.CSharpShortErrorMessageFormat).Replace('<', '{').Replace('>', '}');
+                context.AddSource($"{fileName}.g.cs",
+                    CSharpSyntaxTree.ParseText(template).GetRoot().NormalizeWhitespace().ToFullString());
+            }
+            catch
+            {
+                throw new Exception(template);
+            }
         }
     }
 
